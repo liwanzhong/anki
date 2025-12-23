@@ -225,9 +225,7 @@ impl SimpleServer {
         
         // Step 2: HTTP callback authentication (no lock held)
         let user_info = if self.auth_callback_url.is_some() {
-            self.authenticate_via_callback(&hkey)
-                .await
-                .or_forbidden("authentication failed")?
+            match self.authenticate_via_callback(&hkey).await { Ok(info) => info, Err(_) => return None.or_forbidden("authentication failed"), }
         } else {
             return None.or_forbidden("invalid hkey");
         };
