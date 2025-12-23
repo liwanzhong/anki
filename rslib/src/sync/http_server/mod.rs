@@ -252,7 +252,7 @@ impl SimpleServer {
         }
         
         // Step 5: Insert user with write lock
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.lock().unwrap();
         state.users.insert(
             hkey.clone(),
             User {
@@ -275,7 +275,7 @@ impl SimpleServer {
         &self,
         request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
-        let state = self.state.read().unwrap();
+        let state = self.state.lock().unwrap();
 
         // This control structure might seem a bit crude,
         // its goal is to prevent a timing attack from gaining
