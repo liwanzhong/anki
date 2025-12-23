@@ -282,6 +282,11 @@ impl SimpleServer {
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
         let state = self.state.lock().unwrap();
 
+        // If using callback auth only, reject password-based login
+        if state.users.is_empty() {
+            return None.or_forbidden("password auth not supported");
+        }
+
         // This control structure might seem a bit crude,
         // its goal is to prevent a timing attack from gaining
         // information about whether a specific user exists.
