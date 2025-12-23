@@ -16,7 +16,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::Mutex;
 
 use anki_io::create_dir_all;
 use axum::extract::DefaultBodyLimit;
@@ -52,7 +52,7 @@ use crate::sync::request::MAXIMUM_SYNC_PAYLOAD_BYTES;
 use crate::sync::response::SyncResponse;
 
 pub struct SimpleServer {
-    state: RwLock<SimpleServerInner>,
+    state: Mutex<SimpleServerInner>,
     auth_callback_url: Option<String>,
     base_folder: PathBuf,
 }
@@ -212,13 +212,10 @@ impl SimpleServer {
     {
         let hkey = req.sync_key.clone();
         
-        // Step 1: Check cache with read lock
+        // Step 1: Check cache first
         {
-            let state = self.state.read().unwrap();
-            if state.users.contains_key(&hkey) {
-                drop(state);
-                let mut state = self.state.write().unwrap();
-                let user = state.users.get_mut(&hkey).unwrap();
+            let mut state = self.state.lock().unwrap();
+            if let Some(user) = state.users.get_mut(&hkey) {
                 Span::current().record("uid", &user.name);
                 Span::current().record("client", &req.client_version);
                 Span::current().record("session", &req.session_key);
@@ -226,7 +223,7 @@ impl SimpleServer {
             }
         }
         
-        // Step 2: HTTP callback authentication (no lock)
+        // Step 2: HTTP callback authentication (no lock held)
         let user_info = if self.auth_callback_url.is_some() {
             self.authenticate_via_callback(&hkey)
                 .await
@@ -235,7 +232,7 @@ impl SimpleServer {
             return None.or_forbidden("invalid hkey");
         };
         
-        // Step 3: Create user resources (no lock)
+        // Step 3: Create user resources (no lock held)
         let folder = self.base_folder.join(&user_info.user_id);
         create_dir_all(&folder)
             .whatever_context("creating user folder")
@@ -244,18 +241,14 @@ impl SimpleServer {
             .whatever_context("opening media")
             .or_internal_err("init media")?;
         
-        // Step 4: Double-check (prevent race condition)
-        {
-            let state = self.state.read().unwrap();
-            if state.users.contains_key(&hkey) {
-                drop(state);
-                let mut state = self.state.write().unwrap();
-                let user = state.users.get_mut(&hkey).unwrap();
-                Span::current().record("uid", &user.name);
-                Span::current().record("client", &req.client_version);
-                Span::current().record("session", &req.session_key);
-                return op(user, req);
-            }
+        // Step 4: Double-check and insert (prevent race condition)
+        let mut state = self.state.lock().unwrap();
+        if let Some(user) = state.users.get_mut(&hkey) {
+            // Another thread created it while we were authenticating
+            Span::current().record("uid", &user.name);
+            Span::current().record("client", &req.client_version);
+            Span::current().record("session", &req.session_key);
+            return op(user, req);
         }
         
         // Step 5: Insert user with write lock
@@ -342,7 +335,7 @@ impl SimpleServer {
         }
         
         Ok(SimpleServer {
-            state: RwLock::new(inner),
+            state: Mutex::new(inner),
             auth_callback_url,
             base_folder: base_folder.to_path_buf(),
         })
