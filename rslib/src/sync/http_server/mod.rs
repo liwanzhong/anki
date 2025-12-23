@@ -16,7 +16,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use anki_io::create_dir_all;
 use axum::extract::DefaultBodyLimit;
@@ -52,7 +52,9 @@ use crate::sync::request::MAXIMUM_SYNC_PAYLOAD_BYTES;
 use crate::sync::response::SyncResponse;
 
 pub struct SimpleServer {
-    state: Mutex<SimpleServerInner>,
+    state: RwLock<SimpleServerInner>,
+    auth_callback_url: Option<String>,
+    base_folder: PathBuf,
 }
 
 pub struct SimpleServerInner {
@@ -70,6 +72,10 @@ pub struct SyncServerConfig {
     pub base_folder: PathBuf,
     #[serde(default = "default_ip_header")]
     pub ip_header: ClientIpSource,
+    #[serde(default)]
+    pub auth_callback_url: Option<String>,
+    #[serde(default = "default_callback_timeout")]
+    pub auth_callback_timeout_ms: u64,
 }
 
 fn default_host() -> IpAddr {
@@ -88,6 +94,10 @@ fn default_base() -> PathBuf {
 
 pub fn default_ip_header() -> ClientIpSource {
     ClientIpSource::ConnectInfo
+}
+
+fn default_callback_timeout() -> u64 {
+    5000
 }
 
 impl SimpleServerInner {
@@ -139,8 +149,8 @@ impl SimpleServerInner {
                 Err(_) => break,
             }
         }
-        if users.is_empty() {
-            whatever!("No users defined; SYNC_USER1 env var should be set.");
+        if users.is_empty() && std::env::var("SYNC_AUTH_CALLBACK_URL").is_err() {
+            whatever!("No users defined and no auth callback configured. Set SYNC_USER1 or SYNC_AUTH_CALLBACK_URL.");
         }
         Ok(Self { users })
     }
@@ -151,7 +161,47 @@ fn derive_hkey(user_and_pass: &str) -> String {
     hex::encode(sha1_of_data(user_and_pass.as_bytes()))
 }
 
+#[derive(serde::Deserialize, Debug)]
+struct AuthCallbackResponse {
+    user_id: String,
+    email: String,
+}
+
 impl SimpleServer {
+    async fn authenticate_via_callback(
+        &self,
+        hkey: &str,
+    ) -> error::Result<AuthCallbackResponse, Whatever> {
+        let url = self
+            .auth_callback_url
+            .as_ref()
+            .whatever_context("auth callback not configured")?;
+        
+        tracing::debug!("authenticating via callback: {}", url);
+        
+        let client = reqwest::Client::new();
+        let response = client
+            .post(url)
+            .json(&serde_json::json!({ "hkey": &hkey[..8] }))
+            .timeout(std::time::Duration::from_millis(5000))
+            .send()
+            .await
+            .whatever_context("auth callback request failed")?;
+        
+        if !response.status().is_success() {
+            tracing::warn!("auth callback failed: {}", response.status());
+            whatever!("auth callback returned {}", response.status());
+        }
+        
+        let user_info = response
+            .json::<AuthCallbackResponse>()
+            .await
+            .whatever_context("failed to parse auth callback response")?;
+        
+        tracing::info!("user authenticated: {}", user_info.email);
+        Ok(user_info)
+    }
+
     pub(in crate::sync) async fn with_authenticated_user<F, I, O>(
         &self,
         req: SyncRequest<I>,
@@ -160,11 +210,68 @@ impl SimpleServer {
     where
         F: FnOnce(&mut User, SyncRequest<I>) -> HttpResult<O>,
     {
-        let mut state = self.state.lock().unwrap();
-        let user = state
-            .users
-            .get_mut(&req.sync_key)
-            .or_forbidden("invalid hkey")?;
+        let hkey = req.sync_key.clone();
+        
+        // Step 1: Check cache with read lock
+        {
+            let state = self.state.read().unwrap();
+            if state.users.contains_key(&hkey) {
+                drop(state);
+                let mut state = self.state.write().unwrap();
+                let user = state.users.get_mut(&hkey).unwrap();
+                Span::current().record("uid", &user.name);
+                Span::current().record("client", &req.client_version);
+                Span::current().record("session", &req.session_key);
+                return op(user, req);
+            }
+        }
+        
+        // Step 2: HTTP callback authentication (no lock)
+        let user_info = if self.auth_callback_url.is_some() {
+            self.authenticate_via_callback(&hkey)
+                .await
+                .or_forbidden("authentication failed")?
+        } else {
+            return None.or_forbidden("invalid hkey");
+        };
+        
+        // Step 3: Create user resources (no lock)
+        let folder = self.base_folder.join(&user_info.user_id);
+        create_dir_all(&folder)
+            .whatever_context("creating user folder")
+            .or_internal_err("create folder")?;
+        let media = ServerMediaManager::new(&folder)
+            .whatever_context("opening media")
+            .or_internal_err("init media")?;
+        
+        // Step 4: Double-check (prevent race condition)
+        {
+            let state = self.state.read().unwrap();
+            if state.users.contains_key(&hkey) {
+                drop(state);
+                let mut state = self.state.write().unwrap();
+                let user = state.users.get_mut(&hkey).unwrap();
+                Span::current().record("uid", &user.name);
+                Span::current().record("client", &req.client_version);
+                Span::current().record("session", &req.session_key);
+                return op(user, req);
+            }
+        }
+        
+        // Step 5: Insert user with write lock
+        let mut state = self.state.write().unwrap();
+        state.users.insert(
+            hkey.clone(),
+            User {
+                name: user_info.email.clone(),
+                password_hash: String::new(),
+                col: None,
+                sync_state: None,
+                media,
+                folder,
+            },
+        );
+        let user = state.users.get_mut(&hkey).unwrap();
         Span::current().record("uid", &user.name);
         Span::current().record("client", &req.client_version);
         Span::current().record("session", &req.session_key);
@@ -175,7 +282,7 @@ impl SimpleServer {
         &self,
         request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
 
         // This control structure might seem a bit crude,
         // its goal is to prevent a timing attack from gaining
@@ -227,8 +334,17 @@ impl SimpleServer {
     }
     pub fn new(base_folder: &Path) -> error::Result<Self, Whatever> {
         let inner = SimpleServerInner::new_from_env(base_folder)?;
+        let auth_callback_url = std::env::var("SYNC_AUTH_CALLBACK_URL").ok();
+        
+        // Validate callback URL format
+        if let Some(ref url) = auth_callback_url {
+            reqwest::Url::parse(url).whatever_context("invalid auth callback URL")?;
+        }
+        
         Ok(SimpleServer {
-            state: Mutex::new(inner),
+            state: RwLock::new(inner),
+            auth_callback_url,
+            base_folder: base_folder.to_path_buf(),
         })
     }
 
