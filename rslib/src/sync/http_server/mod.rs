@@ -225,7 +225,10 @@ impl SimpleServer {
         
         // Step 2: HTTP callback authentication (no lock held)
         let user_info = if self.auth_callback_url.is_some() {
-            match self.authenticate_via_callback(&hkey).await { Ok(info) => info, Err(_) => return None.or_forbidden("authentication failed"), }
+            match self.authenticate_via_callback(&hkey).await {
+                Ok(info) => info,
+                Err(_) => return None.or_forbidden("authentication failed"),
+            }
         } else {
             return None.or_forbidden("invalid hkey");
         };
@@ -233,10 +236,10 @@ impl SimpleServer {
         // Step 3: Create user resources (no lock held)
         let folder = self.base_folder.join(&user_info.user_id);
         create_dir_all(&folder)
-            .whatever_context("creating user folder")
+            .map_err(|e| whatever!("creating user folder: {}", e))
             .or_internal_err("create folder")?;
         let media = ServerMediaManager::new(&folder)
-            .whatever_context("opening media")
+            .map_err(|e| whatever!("opening media: {}", e))
             .or_internal_err("init media")?;
         
         // Step 4: Double-check and insert (prevent race condition)
@@ -249,8 +252,7 @@ impl SimpleServer {
             return op(user, req);
         }
         
-        // Step 5: Insert user with write lock
-        let mut state = self.state.lock().unwrap();
+        // Step 5: Insert new user
         state.users.insert(
             hkey.clone(),
             User {
@@ -273,7 +275,7 @@ impl SimpleServer {
         &self,
         request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
 
         // This control structure might seem a bit crude,
         // its goal is to prevent a timing attack from gaining
