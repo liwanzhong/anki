@@ -235,12 +235,17 @@ impl SimpleServer {
         
         // Step 3: Create user resources (no lock held)
         let folder = self.base_folder.join(&user_info.user_id);
-        create_dir_all(&folder)
-            .map_err(|e| whatever!("creating user folder: {}", e))
-            .or_internal_err("create folder")?;
-        let media = ServerMediaManager::new(&folder)
-            .map_err(|e| whatever!("opening media: {}", e))
-            .or_internal_err("init media")?;
+        if let Err(e) = create_dir_all(&folder) {
+            tracing::error!("failed to create user folder: {}", e);
+            return None.or_internal_err("create folder");
+        }
+        let media = match ServerMediaManager::new(&folder) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("failed to open media: {}", e);
+                return None.or_internal_err("init media");
+            }
+        };
         
         // Step 4: Double-check and insert (prevent race condition)
         let mut state = self.state.lock().unwrap();
@@ -275,7 +280,7 @@ impl SimpleServer {
         &self,
         request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
-        let state = self.state.read().unwrap();
+        let state = self.state.lock().unwrap();
 
         // This control structure might seem a bit crude,
         // its goal is to prevent a timing attack from gaining
